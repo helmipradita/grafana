@@ -29,8 +29,10 @@ import (
 	"github.com/grafana/grafana/pkg/infra/log"
 	"github.com/grafana/grafana/pkg/plugins"
 	"github.com/grafana/grafana/pkg/services/accesscontrol"
+	"github.com/grafana/grafana/pkg/services/apiserver/endpoints/request"
 	"github.com/grafana/grafana/pkg/services/datasources"
 	"github.com/grafana/grafana/pkg/services/datasources/awsexternalid"
+	"github.com/grafana/grafana/pkg/services/datasources/permissioncleanup"
 	"github.com/grafana/grafana/pkg/services/featuremgmt"
 	"github.com/grafana/grafana/pkg/services/pluginsintegration/adapters"
 	"github.com/grafana/grafana/pkg/services/pluginsintegration/plugincontext"
@@ -64,6 +66,7 @@ type Service struct {
 	pluginClient              plugins.Client
 	basePluginContextProvider plugincontext.BasePluginContextProvider
 	retriever                 DataSourceRetriever
+	permissionCleaner         *permissioncleanup.Cleaner
 
 	ptc proxyTransportCache
 }
@@ -85,6 +88,7 @@ func ProvideService(
 	quotaService quota.Service, pluginStore pluginstore.Store, pluginClient plugins.Client,
 	basePluginContextProvider plugincontext.BasePluginContextProvider,
 	retriever DataSourceRetriever,
+	permissionCleaner *permissioncleanup.Cleaner,
 ) (*Service, error) {
 	dslogger := log.New("datasources")
 	store := &SqlStore{db: db, logger: dslogger, features: features}
@@ -105,6 +109,7 @@ func ProvideService(
 		pluginClient:              pluginClient,
 		basePluginContextProvider: basePluginContextProvider,
 		retriever:                 retriever,
+		permissionCleaner:         permissionCleaner,
 	}
 
 	ac.RegisterScopeAttributeResolver(NewNameScopeResolver(store))
@@ -588,16 +593,40 @@ func getAvailableName(dsType string, dataSources []*datasources.DataSource) stri
 }
 
 func (s *Service) DeleteDataSource(ctx context.Context, cmd *datasources.DeleteDataSourceCommand) error {
+	namespace := request.GetNamespaceMapper(s.cfg)(cmd.OrgID)
+	iamCleanup := s.permissionCleaner.Enabled(ctx, namespace)
+
 	return s.db.InTransaction(ctx, func(ctx context.Context) error {
 		cmd.UpdateSecretFn = func() error {
 			return s.SecretsStore.Del(ctx, cmd.OrgID, cmd.Name, kvstore.DataSourceSecretType)
 		}
 
+		if !iamCleanup {
+			if err := s.SQLStore.DeleteDataSource(ctx, cmd); err != nil {
+				return err
+			}
+			return s.permissionsService.DeleteResourcePermissions(ctx, cmd.OrgID, cmd.UID)
+		}
+
+		// Callers may identify the datasource by ID or name only.
+		uid := cmd.UID
+		if uid == "" {
+			ds, err := s.SQLStore.GetDataSource(ctx, &datasources.GetDataSourceQuery{ID: cmd.ID, Name: cmd.Name, OrgID: cmd.OrgID}) //nolint:staticcheck // Preserve legacy field compatibility.
+			if err != nil && !errors.Is(err, datasources.ErrDataSourceNotFound) {
+				return err
+			}
+			if ds != nil {
+				uid = ds.UID
+			}
+		}
+
 		if err := s.SQLStore.DeleteDataSource(ctx, cmd); err != nil {
 			return err
 		}
-
-		return s.permissionsService.DeleteResourcePermissions(ctx, cmd.OrgID, cmd.UID)
+		if uid != "" {
+			s.permissionCleaner.DeleteAfterCommit(ctx, namespace, uid)
+		}
+		return nil
 	})
 }
 

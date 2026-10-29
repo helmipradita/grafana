@@ -33,6 +33,7 @@ import (
 	"github.com/grafana/grafana/pkg/plugins/manager/sources"
 	"github.com/grafana/grafana/pkg/registry/apis/query/queryschema"
 	"github.com/grafana/grafana/pkg/services/apiserver/builder"
+	"github.com/grafana/grafana/pkg/services/datasources/permissioncleanup"
 	"github.com/grafana/grafana/pkg/services/featuremgmt"
 	"github.com/grafana/grafana/pkg/services/validations"
 	"github.com/grafana/grafana/pkg/setting"
@@ -76,6 +77,8 @@ type DataSourceAPIBuilder struct {
 	// health), matching the legacy HTTP API behavior.
 	dataSourceRequestValidator validations.DataSourceRequestValidator
 
+	permissionCleaner *permissioncleanup.Cleaner
+
 	// Legacy or Unified -- depending on config
 	store grafanarest.Storage
 }
@@ -92,6 +95,7 @@ func RegisterAPIService(
 	pluginSources sources.Registry,
 	dataSourceRequestValidator validations.DataSourceRequestValidator,
 	proxyDependencies ProxyDependenciesProvider,
+	permissionCleaner *permissioncleanup.Cleaner,
 ) (*DataSourceAPIBuilder, error) {
 	//nolint:staticcheck // not yet migrated to OpenFeature
 	if !features.IsEnabledGlobally(featuremgmt.FlagDatasourceUseNewCRUDAPIs) {
@@ -159,6 +163,7 @@ func RegisterAPIService(
 		}
 
 		builder.SetDataSourceCRUDMetrics(dataSourceCRUDMetric)
+		builder.SetPermissionCleaner(permissionCleaner)
 
 		// Register the openapi and query types
 		if plugin.Schemas != nil {
@@ -226,6 +231,11 @@ func (b *DataSourceAPIBuilder) GetGroupVersion() schema.GroupVersion {
 
 func (b *DataSourceAPIBuilder) SetDataSourceCRUDMetrics(datasourceCRUDMetric *prometheus.HistogramVec) {
 	b.dataSourceCRUDMetric = datasourceCRUDMetric
+}
+
+// SetPermissionCleaner deletes a datasource's IAM ResourcePermission after unified storage deletes it.
+func (b *DataSourceAPIBuilder) SetPermissionCleaner(permissionCleaner *permissioncleanup.Cleaner) {
+	b.permissionCleaner = permissionCleaner
 }
 
 func addKnownTypes(scheme *runtime.Scheme, gv schema.GroupVersion) {
@@ -308,6 +318,9 @@ func (b *DataSourceAPIBuilder) UpdateAPIGroupInfo(apiGroupInfo *genericapiserver
 		unified, err := grafanaregistry.NewRegistryStore(opts.Scheme, ds, optsGetter)
 		if err != nil {
 			return err
+		}
+		if b.permissionCleaner != nil {
+			unified.AfterDelete = b.afterDelete
 		}
 		b.store, err = opts.DualWriteBuilder(ds.GroupResource(), legacyStore, unified)
 		if err != nil {
